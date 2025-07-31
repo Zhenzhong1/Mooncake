@@ -57,6 +57,7 @@ option(BUILD_EXAMPLES "Build examples" ON)
 
 option(BUILD_UNIT_TESTS "Build uint tests" ON)
 option(USE_CUDA "option for enabling gpu features" OFF)
+option(USE_HPU "option for enabling hpu features" OFF)
 option(USE_NVMEOF "option for using NVMe over Fabric" OFF)
 option(USE_TCP "option for using TCP transport" ON)
 option(USE_ASCEND "option for using npu" OFF)
@@ -101,6 +102,16 @@ if (USE_CUDA)
     /usr/local/cuda/lib64
   )
 endif()
+
+if (USE_HPU)
+  add_compile_definitions(USE_HPU)
+  message(STATUS "HPU support is enabled")
+  include_directories(/usr/include/habanalabs/)
+  link_directories(
+    /usr/lib/habanalabs
+  )
+endif()
+
 
 if (USE_TCP)
   add_compile_definitions(USE_TCP)
