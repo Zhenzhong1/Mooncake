@@ -9,7 +9,8 @@
 // Synapse :: Habana Synapse training API
 #include <synapse_api.h>
 // HCCL :: Habana Collective Communications Library
-#include "hccl_inc.hpp"
+#include "hccl_common.hpp"
+#include "hccl_env.hpp"
 
 
 #ifdef NDEBUG
