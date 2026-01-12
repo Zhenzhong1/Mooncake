@@ -18,6 +18,10 @@
 #include <cuda_runtime.h>
 #endif
 
+#ifdef USE_HPU
+#include <synapse_api.h>
+#endif
+
 namespace mooncake {
 
 uintptr_t alignPage(uintptr_t address) { return address & ~(pagesize - 1); }

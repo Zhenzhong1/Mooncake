@@ -47,6 +47,11 @@ if (USE_CUDA)
   endif()
 endif()
 
+if (USE_HPU)
+  target_include_directories(transfer_engine PRIVATE /usr/include/habanalabs/)
+  target_link_libraries(transfer_engine PUBLIC Synapse)
+endif()
+
 if (USE_ASCEND)
   file(GLOB ASCEND_TOOLKIT_ROOT "/usr/local/Ascend/ascend-toolkit/latest/*-linux")
   set(ASCEND_LIB_DIR "${ASCEND_TOOLKIT_ROOT}/lib64")

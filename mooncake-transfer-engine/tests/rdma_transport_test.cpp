@@ -30,6 +30,7 @@
 #include <iomanip>
 #include <memory>
 
+
 #include "transfer_engine.h"
 #include "transport/transport.h"
 #include "common.h"
@@ -51,6 +52,11 @@ static void checkCudaError(cudaError_t result, const char *message) {
         exit(EXIT_FAILURE);
     }
 }
+#endif
+
+#ifdef USE_HPU
+#include <synapse_api.h>
+#include "hpu_device.hpp"
 #endif
 
 #define NR_SOCKETS (1)
@@ -77,7 +83,13 @@ DEFINE_bool(use_vram, true, "Allocate memory from GPU VRAM");
 DEFINE_int32(gpu_id, 0, "GPU ID to use");
 #endif
 
+#ifdef USE_HPU
+DEFINE_bool(use_vram, true, "Allocate memory from GPU VRAM");
+DEFINE_int32(hpu_id, 0, "GPU ID to use, -1 for all GPUs");
+#endif
+
 using namespace mooncake;
+
 
 static void *allocateMemoryPool(size_t size, int socket_id,
                                 bool from_vram = false) {
@@ -91,6 +103,30 @@ static void *allocateMemoryPool(size_t size, int socket_id,
         return d_buf;
     }
 #endif
+
+#ifdef USE_HPU
+    if (from_vram) {
+        synStatus status;
+        synDeviceId deviceId = 0;
+        uint64_t* hpu_buf = nullptr;
+        uint32_t flags = 0;
+        uint64_t reqAddr = 0;
+        status = synDeviceMalloc(deviceId, size, flags, reqAddr,  (uint64_t*)&hpu_buf);
+        if (status != synSuccess) {
+            std::cerr << "Failed to synDeviceMalloc" << std::endl;
+            return nullptr;
+        }
+        std::cout << hpu_buf << std::endl;
+        printf("HPU memory allocated at address: %p (size=%zu bytes)\n", hpu_buf, size);
+        // return (void*)hpu_buf;
+    }
+
+    Buffers buffers;
+
+
+
+#endif
+
     return numa_alloc_onnode(size, socket_id);
 }
 
@@ -113,6 +149,114 @@ static void freeMemoryPool(void *addr, size_t size) {
 #endif
 }
 
+
+static HCL_Rank handleCustomComm(EnvData& envData, DeviceResources& resources)
+{
+    // Custom comm is not supported for send_recv and scale_validation
+    if (envData.testType == "send_recv" || envData.testType == "scale_validation")
+    {
+        throw std::runtime_error {"Custom comm is not supported for this test type"};
+    }
+
+    std::vector<HCL_Rank> peers = envData.customComm;
+
+    // Choosing new root rank if it is not part of the custom comm.
+    std::vector<HCL_Rank>::iterator rootIt = find(peers.begin(), peers.end(), envData.root);
+    if (rootIt == peers.end())
+    {
+        rootIt       = peers.begin();
+        envData.root = *peers.begin();
+        if (isRoot(envData))
+        {
+            log() << "While building a new custom communicator, the root rank is automatically set to "
+                  << *peers.begin() << "." << std::endl;
+        }
+    }
+
+    // Check if the current rank is part of the custom comm
+    std::vector<HCL_Rank>::iterator rankIt = find(peers.begin(), peers.end(), envData.rank);
+    if (rankIt == peers.end())
+    {
+        log() << "HCCL demo process id (" << envData.rank << ") will not participate in the custom communicator"
+              << std::endl;
+#if MPI_ENABLED
+        hcclUniqueId uniqueID {};
+        CHECK_MPI_STATUS(MPI_Bcast(&uniqueID, sizeof(uniqueID), MPI_BYTE, envData.root, MPI_COMM_WORLD));
+        CHECK_MPI_STATUS(MPI_Finalize());
+#endif
+        exit(0);
+    }
+
+    // In the custom comm - override params to match new custom comm
+    envData.nranks     = peers.size();
+    resources.commRoot = distance(peers.begin(), rootIt);
+
+    return distance(peers.begin(), rankIt);
+}
+
+static void initDevice(EnvData& envData, DeviceResources& resources)
+{
+    HCL_Rank commRank = envData.rank;
+    if (envData.customComm.size() == 0)
+    {
+        // Generate HCCL comm world
+        resources.commRoot = envData.root;
+        for (HCL_Rank i = 0; i < envData.nranks; i++)
+        {
+            envData.customComm.push_back(i);
+        }
+    }
+    else
+    {
+        commRank = handleCustomComm(envData, resources);
+    }
+
+    // Initialize Synapse API context
+    CHECK_SYNAPSE_STATUS(synInitialize());
+
+    // Acquire device
+    synModuleId deviceModuleID = envData.rank % envData.ranksPerNode;
+    synStatus   rc             = synDeviceAcquireByModuleId(&resources.deviceHandle, deviceModuleID);
+    if (rc != synSuccess)
+    {
+        deviceModuleID = INVALID_MODULE_ID;
+        CHECK_SYNAPSE_STATUS(synDeviceAcquire(&resources.deviceHandle, nullptr));
+    }
+
+#if AFFINITY_ENABLED
+    if (setupAffinity(deviceModuleID) != 0)
+    {
+        throw std::runtime_error {"Affinity setting for HCCL demo failed."};
+    }
+#endif
+
+    // Generate unique id
+    hcclUniqueId uniqueID {};
+    if (isRoot(envData))
+    {
+        CHECK_HCCL_STATUS(hcclGetUniqueId(&uniqueID));
+    }
+
+#if MPI_ENABLED
+    CHECK_MPI_STATUS(MPI_Bcast(&uniqueID, sizeof(uniqueID), MPI_BYTE, envData.root, MPI_COMM_WORLD));
+#endif  // MPI_ENABLED
+
+    // Create new HCCL communicator
+    std::cout << "envData.nranks: " << envData.nranks << " envData.rank : "<< envData.rank << " commRank: " << commRank <<std::endl;
+    CHECK_HCCL_STATUS(hcclCommInitRank(&resources.comm, envData.nranks, uniqueID, commRank));
+
+    // Create Streams
+    CHECK_SYNAPSE_STATUS(synStreamCreateGeneric(&resources.collectiveStream, resources.deviceHandle, 0));
+    CHECK_SYNAPSE_STATUS(synStreamCreateGeneric(&resources.deviceToHostStream, resources.deviceHandle, 0));
+    CHECK_SYNAPSE_STATUS(synStreamCreateGeneric(&resources.hostToDeviceStream, resources.deviceHandle, 0));
+}
+
+
+
+
+
+
+
 int initiatorWorker(TransferEngine *engine, SegmentID segment_id, int thread_id,
                     void *addr) {
     bindToSocket(0);
@@ -122,7 +266,7 @@ int initiatorWorker(TransferEngine *engine, SegmentID segment_id, int thread_id,
     {
         LOG(INFO) << "Stage 1: Write Data";
         for (size_t offset = 0; offset < kDataLength; ++offset)
-            *((char *)(addr) + offset) = 'a' + lrand48() % 26;
+            *((char *)(addr) + offset) = 'Z' + lrand48() % 26;
 
         LOG(INFO) << "Write Data: " << std::string((char *)(addr), 16) << "...";
 
@@ -230,6 +374,181 @@ std::string loadNicPriorityMatrix() {
            device_names + "], []]}";
 }
 
+static void
+prepareBuffers(const EnvData& envData, const DeviceResources& resources, const uint64_t size, Buffers& buffers)
+{
+    // Calculate buffers sizes
+    buffers.inputSize = size;
+    if (envData.testType == "all_gather")
+    {
+        buffers.outputSize = size * envData.nranks;
+    }
+    else if (envData.testType == "reduce_scatter")
+    {
+        buffers.outputSize = size / envData.nranks;
+    }
+    else
+    {
+        buffers.outputSize = size;
+    }
+
+    // Validate calculated buffer size.
+    if (buffers.inputSize < getDataTypeSize(envData) || buffers.outputSize < getDataTypeSize(envData))
+    {
+        throw std::runtime_error {"Invalid buffer size"};
+    }
+
+    // Calculate number of buffers
+    const uint64_t maxBufferSize   = std::max(buffers.inputSize, buffers.outputSize);
+    uint64_t       numberOfBuffers = 1;
+    if (!envData.useSameBuffers)
+    {
+        if (maxBufferSize <= ALLOCATED_HBM_SIZE)
+        {
+            numberOfBuffers = (ALLOCATED_HBM_SIZE / maxBufferSize) <= AMOUNT_JUMBO_BUFFERS
+                                  ? AMOUNT_JUMBO_BUFFERS
+                                  : ALLOCATED_HBM_SIZE / maxBufferSize;
+        }
+        else  // use at least 2 buffers for performance
+        {
+            numberOfBuffers = 2;
+        }
+    }
+    numberOfBuffers = std::min(numberOfBuffers, MAX_BUFFER_COUNT);
+
+    // Allocate buffers on the device
+    uint64_t inputDevPtr      = 0;
+    uint64_t outputDevPtr     = 0;
+    buffers.correctnessDevPtr = 0;
+    CHECK_SYNAPSE_STATUS(
+        synDeviceMalloc(resources.deviceHandle, buffers.inputSize * numberOfBuffers, 0, 0, &inputDevPtr));
+    CHECK_SYNAPSE_STATUS(
+        synDeviceMalloc(resources.deviceHandle, buffers.outputSize * numberOfBuffers, 0, 0, &outputDevPtr));
+
+    for (uint64_t index = 0; index < numberOfBuffers; index++)
+    {
+        buffers.inputDevPtrs.push_back(inputDevPtr + (index * buffers.inputSize));
+        buffers.outputDevPtrs.push_back(outputDevPtr + (index * buffers.outputSize));
+    }
+
+    // Set default correctness buffer on the device
+    buffers.correctnessDevPtr = buffers.outputDevPtrs[0];
+}
+
+static hcclResult_t sendRecvTest(const EnvData&         envData,
+                                 const DeviceResources& resources,
+                                 const HCL_Rank         recvFromRank,
+                                 const HCL_Rank         sendToRank,
+                                 const size_t           count,
+                                 const void*            sendbuff,
+                                 void*                  recvbuff)
+{
+    hcclGroupStart();
+
+    CHECK_HCCL_STATUS(
+        hcclSend(sendbuff, count, getDataType(envData), sendToRank, resources.comm, resources.collectiveStream));
+    CHECK_HCCL_STATUS(
+        hcclRecv(recvbuff, count, getDataType(envData), recvFromRank, resources.comm, resources.collectiveStream));
+
+    hcclGroupEnd();
+
+    return hcclSuccess;
+}
+
+void sendRecvTestDefaultDriver(const EnvData&         envData,
+                               const DeviceResources& resources,
+                               Buffers&               buffers,
+                               const uint64_t         size,
+                               Stats&                 stats)
+{
+    // The flow of the test is as follows:
+    // For single box, exchange buffer with adjacent rank. If odd number of ranks then last rank does self send/recv.
+    // For scale-out test, exchange buffer with next peer rank in ring manner.
+    //
+    // Example:
+    // 4 boxes: R0 -> R8 & R0 <- R24, R8 <- R0 & R8 -> R16, R16 <- R8 & R16 -> R24, R24 <- R16 & R24 ->R0 etc.
+    // 2 boxes: R0 <> R8, R1 <> R9, etc.
+    //
+    // In both cases, each rank does 1 send and 1 recv from another (same) rank.
+    const size_t scaleupGroupSize = envData.scaleupGroupSize;
+    const size_t numOfRanks       = envData.nranks;
+    size_t       numOfBoxes       = envData.nranks / envData.scaleupGroupSize;
+    if (numOfRanks % scaleupGroupSize > 0)
+    {
+        numOfBoxes++;
+    }
+    const size_t ranksPerBox = numOfRanks / numOfBoxes;
+
+    const HCL_Rank myRank   = envData.rank;
+    const size_t   myBoxNum = myRank / scaleupGroupSize;
+
+    HCL_Rank sendToRank;
+    HCL_Rank recvFromRank;
+    if (numOfBoxes > 1)
+    // scaleout
+    {
+        // Do ring with adjacent boxes
+        const size_t targetSendBox = myBoxNum == numOfBoxes - 1 ? 0 : myBoxNum + 1;
+        sendToRank                 = targetSendBox * ranksPerBox + (myRank % ranksPerBox);
+        const size_t targetRecvBox = myBoxNum == 0 ? numOfBoxes - 1 : myBoxNum - 1;
+        recvFromRank               = targetRecvBox * ranksPerBox + (myRank % ranksPerBox);
+    }
+    else
+    // single box
+    {
+        // send / recv from adjacent even/odd pairs ranks, i.e. R0 <>R1, R2<>R3.
+        // in case of odd number of ranks - last rank will do send/recv with self.
+        sendToRank   = (myRank % 2) != 0                                       ? myRank - 1
+                       : ((numOfRanks % 2) && (myRank == numOfRanks - 1)) != 0 ? myRank
+                                                                               : myRank + 1;
+        recvFromRank = sendToRank;
+    }
+
+    int iter = 1;
+    uint64_t index = iter % buffers.inputDevPtrs.size();
+    CHECK_HCCL_STATUS(sendRecvTest(envData,
+                                           resources,
+                                           recvFromRank,
+                                           sendToRank,
+                                           buffers.inputSize / getDataTypeSize(envData),
+                                           (const void*)buffers.inputDevPtrs[index],
+                                           (void*)buffers.outputDevPtrs[index]))
+
+    // stats.rankDurationInSec = benchmark(
+    //     envData,
+    //     resources,
+    //     [&](uint64_t iter) {
+    //         uint64_t index = iter % buffers.inputDevPtrs.size();
+    //         CHECK_HCCL_STATUS(sendRecvTest(envData,
+    //                                        resources,
+    //                                        recvFromRank,
+    //                                        sendToRank,
+    //                                        buffers.inputSize / getDataTypeSize(envData),
+    //                                        (const void*)buffers.inputDevPtrs[index],
+    //                                        (void*)buffers.outputDevPtrs[index]));
+    //     },
+    //     [&]() {
+    //         CHECK_HCCL_STATUS(sendRecvTest(envData,
+    //                                        resources,
+    //                                        recvFromRank,
+    //                                        sendToRank,
+    //                                        buffers.inputSize / getDataTypeSize(envData),
+    //                                        (const void*)buffers.inputDevPtrs[0],
+    //                                        (void*)buffers.correctnessDevPtr));
+    //     });
+
+    // // Calculate expected results for correctness check
+    // if (envData.shouldCheckCorrectness)
+    // {
+    //     for (size_t i = 0; i < buffers.outputSize / getDataTypeSize(envData); i++)
+    //     {
+    //         stats.expectedOutputs.push_back(getInput(recvFromRank, envData.nranks, i));
+    //     }
+    // }
+
+    stats.isDescribing = true;
+}
+
 int initiator() {
     const size_t ram_buffer_size = 1ull << 30;
     // disable topology auto discovery for testing.
@@ -264,8 +583,188 @@ int initiator() {
     int rc = engine->registerLocalMemory(
         addr, ram_buffer_size, name_prefix + std::to_string(name_suffix));
     LOG_ASSERT(!rc);
+#elif defined(USE_HPU)
+
+    hpu_device ctx;
+    // auto envData = getenvData();
+    DeviceResources resources;
+    // initDevice(envData, resources);
+
+    // double size = 1024;
+    Buffers buffers;
+    // prepareBuffers(envData, resources, size, buffers);
+
+    printf("%s, %d, USE_HPU\n", __func__, __LINE__);
+    hcclUniqueId uniqueID {};
+    CHECK_HCCL_STATUS(hcclGetUniqueId(&uniqueID));
+    HCL_Rank commRank = 1;
+    hcclComm_t      comm;
+  // Create new HCCL communicator
+    CHECK_HCCL_STATUS(hcclCommInitRank(&comm, 1, uniqueID, 0));
+
+    printf("%s, %d, USE_HPU\n", __func__, __LINE__);
+    // Create Streams
+    synStreamHandle stream;
+    CHECK_SYNAPSE_STATUS(synStreamCreateGeneric(&stream, 0, 0));
+
+    uint64_t inputDevPtr      = 0;
+    uint64_t outputDevPtr     = 0;
+    buffers.inputSize = 16;
+    buffers.outputSize = 16;
+    buffers.correctnessDevPtr = 0;
+    uint64_t       numberOfBuffers = 1;
+
+
+    CHECK_SYNAPSE_STATUS(
+        synDeviceMalloc(0, buffers.inputSize * numberOfBuffers, 0, 0, &inputDevPtr));
+    CHECK_SYNAPSE_STATUS(
+        synDeviceMalloc(0, buffers.outputSize * numberOfBuffers, 0, 0, &outputDevPtr));
+    CHECK_SYNAPSE_STATUS(synDeviceMalloc(0, buffers.outputSize, 0, 0, &buffers.correctnessDevPtr));
+
+    printf("%s, %d, USE_HPU\n", __func__, __LINE__);
+    for (uint64_t index = 0; index < numberOfBuffers; index++)
+    {
+        buffers.inputDevPtrs.push_back(inputDevPtr + (index * buffers.inputSize));
+        buffers.outputDevPtrs.push_back(outputDevPtr + (index * buffers.outputSize));
+    }
+
+    std::vector<float> inputHostData(buffers.inputSize / sizeof(float));
+    void*          inputHostDataPtr = reinterpret_cast<void*>(inputHostData.data());
+
+    // Create inputs
+    for (size_t i = 0; i < inputHostData.size(); i++)
+    {
+        inputHostData[i] = i + 100;
+    }
+
+    CHECK_SYNAPSE_STATUS(synHostMap(0, buffers.inputSize, inputHostDataPtr));
+    CHECK_SYNAPSE_STATUS(synMemCopyAsync(stream,
+                                         (uint64_t)inputHostDataPtr,
+                                         buffers.inputSize,
+                                         buffers.inputDevPtrs[0],
+                                         HOST_TO_DRAM));
+    CHECK_SYNAPSE_STATUS(synStreamSynchronize(stream));
+
+    for (size_t i = 0; i < inputHostData.size(); i++) {
+        std::cout << "=======inputHostData======== " << inputHostData[i] << std::endl;
+    }
+
+
+    printf("%s, %d, USE_HPU\n", __func__, __LINE__);
+
+
+    auto sendbuff = (const void*)buffers.inputDevPtrs[0];
+    auto recvbuff = (void*)buffers.outputDevPtrs[0];
+    //auto count = buffers.inputSize / getDataTypeSize(envData);
+    auto count = buffers.inputSize / sizeof(float);
+
+    std::cout << "sendbuff:  " << sendbuff << std::endl;
+    std::cout << "recvbuff: " << recvbuff << std::endl;
+
+    printf("%s, %d, USE_HPU\n", __func__, __LINE__);
+
+    hcclGroupStart();
+
+    CHECK_HCCL_STATUS(
+        hcclSend(sendbuff, count,  hcclFloat32, 0, comm, stream));
+    printf("%s, %d, USE_HPU\n", __func__, __LINE__);
+    CHECK_HCCL_STATUS(
+        hcclRecv(recvbuff, count,  hcclFloat32, 0, comm, stream));
+
+    hcclGroupEnd();
+
+    printf("%s, %d, USE_HPU\n", __func__, __LINE__);
+
+    CHECK_SYNAPSE_STATUS(synStreamSynchronize(stream));
+    auto        outputHostData    = std::vector<float>(buffers.outputSize / sizeof(float));
+    const void* outputHostDataPtr = reinterpret_cast<void*>(outputHostData.data());
+
+    printf("%s, %d, USE_HPU\n", __func__, __LINE__);
+    CHECK_SYNAPSE_STATUS(synHostMap(0, buffers.outputSize, outputHostDataPtr));
+    printf("%s, %d, USE_HPU\n", __func__, __LINE__);
+    CHECK_SYNAPSE_STATUS(synMemCopyAsync(stream, (uint64_t)recvbuff, buffers.outputSize, (uint64_t)outputHostDataPtr, DRAM_TO_HOST));
+    printf("%s, %d, USE_HPU\n", __func__, __LINE__);
+    CHECK_SYNAPSE_STATUS(synStreamSynchronize(stream));
+
+
+    // CHECK_SYNAPSE_STATUS(synMemCopyAsync(stream, (uint64_t)dev_src.data(), ele_size * sizeof(float), (uint64_t)host_dst.data(), DRAM_TO_HOST));
+    // CHECK_SYNAPSE_STATUS(synStreamSynchronize(stream));
+    for (size_t i = 0; i < outputHostData.size(); i++) {
+        std::cout << "=======outputHostData======== " << outputHostData[i] << std::endl;
+    }
+
+
+
+    // auto ele_size = 8;
+    // hpu_vector<float> dev_src = ctx.create_hpumem<float>(ele_size);
+    // host_vector<float> host_src = ctx.create_hostmem<float>(ele_size);
+    // for (size_t i = 0; i < dev_src.size(); i++) {
+    //     host_src.data()[i] = i + 10;
+    // }
+
+    // for (size_t i = 0; i < host_src.size(); i++) {
+    //     std::cout << "=============== " << host_src.data()[i] << std::endl;
+    // }
+
+    // std::cout << " dev_src.data() :" << dev_src.data() << std::endl;
+    // std::cout << " host_src.data() : " << host_src.data() << std::endl;
+    // CHECK_SYNAPSE_STATUS(synMemCopyAsync(stream, (uint64_t)host_src.data(), ele_size * sizeof(float),
+    //                 (uint64_t)dev_src.data(), HOST_TO_DRAM));
+
+    // CHECK_HCCL_STATUS(
+    //     hcclSend(dev_src.data(), ele_size,  hcclFloat32, 0, comm, stream));
+    
+    // // 测试一张卡上内存搬运。
+    // host_vector<float> host_dst = ctx.create_hostmem<float>(ele_size);
+    // CHECK_SYNAPSE_STATUS(synMemCopyAsync(stream, (uint64_t)dev_src.data(), ele_size * sizeof(float), (uint64_t)host_dst.data(), DRAM_TO_HOST));
+    // CHECK_SYNAPSE_STATUS(synStreamSynchronize(stream));
+    // for (size_t i = 0; i < host_dst.size(); i++) {
+    //     std::cout << "=======host_dst======== " << host_dst.data()[i] << std::endl;
+    // }
+
+
+
+
+    // printf("%s, %d, USE_HPU\n", __func__, __LINE__);
+    // hpu_vector<float> dev_dst = ctx.create_hpumem<float>(ele_size);
+    // host_vector<float> host_dst = ctx.create_hostmem<float>(ele_size);
+
+    // CHECK_HCCL_STATUS(
+    //     hcclRecv(dev_dst.data(), ele_size,  hcclFloat32, 0, comm, stream));
+
+
+    // CHECK_SYNAPSE_STATUS(synMemCopyAsync(stream, (uint64_t)dev_dst.data(), ele_size * sizeof(float), (uint64_t)host_dst.data(), DRAM_TO_HOST));
+
+    // CHECK_SYNAPSE_STATUS(synStreamSynchronize(stream));
+    // for (size_t i = 0; i < host_dst.size(); i++) {
+    //     std::cout << "=============== " << host_dst.data()[i] << std::endl;
+    // }
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+    printf("%s, %d, USE_HPU\n", __func__, __LINE__);
+    addr = allocateMemoryPool(ram_buffer_size, 0, FLAGS_use_vram);
+    printf("HPU allocated address: %p\n", addr);
+    std::string name_prefix = FLAGS_use_vram ? "hpu:" : "cpu:";
+    int name_suffix = FLAGS_use_vram ? FLAGS_hpu_id : 0;
+    int rc = engine->registerLocalMemory(
+        addr, ram_buffer_size, name_prefix + std::to_string(name_suffix));
+    LOG_ASSERT(!rc);
 #else
     addr = allocateMemoryPool(ram_buffer_size, 0, false);
+    printf("CPU allocated address: %p\n", addr);
     int rc = engine->registerLocalMemory(addr, ram_buffer_size, kWildcardLocation);
     LOG_ASSERT(!rc);
 #endif
@@ -316,6 +815,7 @@ int target() {
 int main(int argc, char **argv) {
     gflags::ParseCommandLineFlags(&argc, &argv, false);
 
+    
     if (FLAGS_mode == "initiator")
         return initiator();
     else if (FLAGS_mode == "target")
